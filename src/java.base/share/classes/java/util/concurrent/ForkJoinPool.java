@@ -728,11 +728,13 @@ public class ForkJoinPool extends AbstractExecutorService {
     // Bounds
     static final int SWIDTH       = 16;            // width of short
     static final int SMASK        = 0xffff;        // short bits == max index
-    static final int MAX_CAP      = 0x7fff;        // max #workers - 1
+    static final int MAX_CAP      = 0x7fff;        // max #workers - 1 即2^15-1
     static final int SQMASK       = 0x007e;        // max 64 (even) slots
 
     // Masks and units for WorkQueue.phase and ctl sp subfield
+    //表示工作线程需要唤醒（工作线程处于阻塞）
     static final int UNSIGNALLED  = 1 << 31;       // must be negative
+    //避免ABA问题的版本号递增基数
     static final int SS_SEQ       = 1 << 16;       // version count
     static final int QLOCK        = 1;             // must be 1
 
@@ -742,6 +744,7 @@ public class ForkJoinPool extends AbstractExecutorService {
     static final int SHUTDOWN     = 1 << 18;
     static final int TERMINATED   = 1 << 19;
     static final int STOP         = 1 << 31;       // must be negative
+    //工作队列静止状态（意味着任务队列中没有任务要执行，也退出了等待队列？？还是任务队列绑定的线程已经终止？？）
     static final int QUIET        = 1 << 30;       // not scanning or working
     static final int DORMANT      = QUIET | UNSIGNALLED;
 
@@ -773,6 +776,47 @@ public class ForkJoinPool extends AbstractExecutorService {
      */
     @jdk.internal.vm.annotation.Contended
     static final class WorkQueue {
+        /**
+         * 注意：
+         *  虽然各个字段的31位和32位都用同一个常量来表示，或QUIET或UNSIGNALLED，实际上在不同字段中它们含义不尽相同
+         *
+         * source：
+         *      （一般表示有任务正在执行scan操作）任务一般是偷一个执行一个，并不需要
+         *      转移队列（不需要入队出队，也就是不需要一直刷新source）。
+         *      低16位：表示当前正在偷取的目标任务队列在线程池中的索引。
+         *      第31位：标识任务队列的QUITE状态（当前任务队列不为空，但是array中没有任务）
+         *      第32位：标识等待被唤醒状态：如果该任务队列等待被唤醒（闲置），则source为负数
+         *
+         *      source等于0：source为0是一个中间状态，表明线程已经是唤醒状态，但是目前没有在偷任务（大概表示线程正在scan）
+         *
+         *      source的一个使用：
+         *      注意到在ForkJoinPool中，
+         *      1）只有runWorker方法会压入任务队列到阻塞队列
+         *          在scan搞定所有的任务队列之后，当前任务队列已经确保没有待执行任务了，故将其加入阻塞队列。
+         *          不仅只有才有阻塞队列入队操作，也只有这里会设置phase为等待唤醒（unsignalled）。也只有这里有可能
+         *          设置phase为quiet（当任务队列从阻塞队列弹出，且它的驻留线程退出时）
+         *      2）也只有runWorker方法会执行LockSupport.park操作。
+         *          在调用interrupted方法清空中断标志之后，真正阻塞一个线程之前，
+         *          会设置对应任务队列的source为quiet和unsignaled。且只有这个地方会设置source的unsignalled位为1.
+         *          另外，在ForkJoinPool中，真正的唤醒操作仅在tryCompensate和signalWork两个方法中存在。且在unpark之前
+         *          必须满足source为负数（unsignalled标志位等于1）
+         *
+         * id: workQueue的id字段低16位记录队列在池中的索引（除了共享队列外也会记录工作队列的信息），
+         *     高16位包含FIFO信息、OWNED信息（奇偶性表示）、QUIET信息、UNSIGNALLED信息。
+         *     但是每次记录只会发生在workQueue新增的时候。这个字段不是volatile的（因为不需要更新？）
+         *     只有phase会根据运行时状态发生更新，id不会发生更新（目前看来是这样的。。可能有误）
+         *
+         * phase：
+         *  1： 共享队列上锁。非0和1的时候（值为负数说明在ctl对应的阻塞队列（Treiber stack），
+         *      值为正数，说明已经唤醒，不在阻塞队列中）说明该队列是工作队列。
+         *      如果是0或者1说明该队列是共享队列，具体细节在id中保存。
+         *  低16位：队列在池中的索引
+         *  第17位：队列FIFO标志位
+         *  第31位：队列静止标志位（表示array中没有任务，且驻留线程已经退出）
+         *  第32位：队列唤醒标志位（如果为1，则整体值是负数，任务队列已经加入阻塞队列栈）
+         *
+         *
+         */
         volatile int source;       // source queue id, or sentinel
         int id;                    // pool index, mode, tag
         int base;                  // index of next slot for poll
@@ -868,6 +912,7 @@ public class ForkJoinPool extends AbstractExecutorService {
                     growArray(true);
                 else {
                     phase = 0; // full volatile unlock
+                    //任务太少，唤醒线程来生产任务
                     if (((s - base) & ~1) == 0) // size 0 or 1
                         signal = true;
                 }
@@ -1011,17 +1056,21 @@ public class ForkJoinPool extends AbstractExecutorService {
          * queue, up to bound n (to avoid infinite unfairness).
          */
         final void topLevelExec(ForkJoinTask<?> t, WorkQueue q, int n) {
+            //初始化被偷数量为1
             int nstolen = 1;
             for (int j = 0;;) {
                 if (t != null)
+                    //执行任务，初始值是参数中传入的被偷到的任务
                     t.doExec();
                 if (j++ <= n)
+                    //获取当前任务队列中其它的任务
                     t = nextLocalTask();
                 else {
                     j = 0;
                     t = null;
                 }
                 if (t == null) {
+                    //从本次（外层循环指定）任务队列头部（base）获取其它的任务，每重新偷一个，被偷数量nstolen加1.
                     if (q != null && (t = q.poll()) != null) {
                         ++nstolen;
                         j = 0;
@@ -1031,9 +1080,13 @@ public class ForkJoinPool extends AbstractExecutorService {
                 }
             }
             ForkJoinWorkerThread thread = owner;
+            //当前队列已偷（并处理）任务数量维护
             nsteals += nstolen;
+            //这里设置为0，是因为已经没有任务要执行了，但是线程又没有退出，在方法退出后最后在runWorker中将任务队列压入阻塞队列之后
+            //会将source置为负数（所以source为0是一个中间状态，已经是唤醒状态，但是目前没有在偷任务）
             source = 0;
             if (thread != null)
+                //工作者线程执行完上面的任务后，会触发一次 afterTopLevelExec 回调
                 thread.afterTopLevelExec();
         }
 
@@ -1052,6 +1105,7 @@ public class ForkJoinPool extends AbstractExecutorService {
                     else if (t == task) {
                         if (QA.compareAndSet(a, index, t, null)) {
                             top = ns;   // safely shift down
+                            //安全地将任务队列中的任务下移，以填充移除造成的空值
                             for (int j = i; j != ns; ++j) {
                                 ForkJoinTask<?> f;
                                 int pindex = (j + 1) & m;
@@ -1074,7 +1128,7 @@ public class ForkJoinPool extends AbstractExecutorService {
          * until done, not found, or limit exceeded.
          *
          * @param task root of CountedCompleter computation
-         * @param limit max runs, or zero for no limit
+         * @param limit max runs, or zero for no limit 最大循环次数，如果为0则表示没有上限
          * @param shared true if must lock to extract task
          * @return task status on exit
          */
@@ -1082,9 +1136,11 @@ public class ForkJoinPool extends AbstractExecutorService {
             int status = 0;
             if (task != null && (status = task.status) >= 0) {
                 int s, k, cap; ForkJoinTask<?>[] a;
+                //只要对应任务队列中还有任务，就继续循环
                 while ((a = array) != null && (cap = a.length) > 0 &&
                        (s = top) - base > 0) {
                     CountedCompleter<?> v = null;
+                    //取出任务队列顶部任务
                     ForkJoinTask<?> o = a[k = (cap - 1) & (s - 1)];
                     if (o instanceof CountedCompleter) {
                         CountedCompleter<?> t = (CountedCompleter<?>)o;
@@ -1235,7 +1291,7 @@ public class ForkJoinPool extends AbstractExecutorService {
     private static final long DEFAULT_KEEPALIVE = 60_000L;
 
     /**
-     * Undershoot tolerance for idle timeouts
+     * Undershoot tolerance for idle timeouts 允许的误差
      */
     private static final long TIMEOUT_SLOP = 20L;
 
@@ -1252,6 +1308,8 @@ public class ForkJoinPool extends AbstractExecutorService {
     /**
      * Increment for seed generators. See class ThreadLocal for
      * explanation.
+     * 这个数来自黄金分割率：0x9e3779b9/0x100000000 = 2654435769/4294967296 ≈ 0.6180339886
+     * 用它除以2^32即黄金分割率。相当于将2^32比特黄金分割的一个位置。
      */
     private static final int SEED_INCREMENT = 0x9e3779b9;
 
@@ -1281,6 +1339,20 @@ public class ForkJoinPool extends AbstractExecutorService {
      * parallelism level to make them comparable to the ctl rc and tc
      * fields.
      */
+    /*
+     * ctl在forljoinpool的构造函数中初始化，
+     * TC：初始化为corePoolSize池中常驻线程值得补码，即实际线程数大于等于
+     *     预设常驻线程数，该值才会大于等于0.
+     * RC：初始化为并行系数parallelism的补码，即实际活跃线程数大于等于并行系数
+     *     该值才会大于等于0
+     * SS：等待线程栈，栈顶线程的版本号及线程状态
+     * ID：等待线程栈，栈顶线程在forkJoinPool池中的索引（workQueues索引）
+     *
+     * 当rc为负数，说明现在存在的活跃线程数还没到目标值（小于预计的并发系数）
+     * 当tc为负数，说明现在已创建的线程数还没达到目标值（小于预计的核心池大小）
+     * 我们使 sp = （int)ctl;
+     * 当sp值非0：说明当前等待区线程栈非空，有线程正在等待中。
+     */
 
     // Lower and upper word masks
     private static final long SP_MASK    = 0xffffffffL;
@@ -1299,6 +1371,25 @@ public class ForkJoinPool extends AbstractExecutorService {
 
     // Instance fields
 
+    /*
+     * stealCount：
+     * ForkJoinPool池中通过偷窃完成的任务总数的一个估计值。该值保持很高说明线程很忙，该值变低则表示
+     * 负载和竞争在减少。
+     *
+     * bounds ：
+     * 低16位表示除开并行系数外至少应该有的线程数（为了满足最小可用限制）
+     * 高16位表示除开并行系数外最大可创建线程数
+     * 根据线程创建销毁应该动态维护
+     *
+     * mode：
+     * 初始化后，低16位是并行系数，高16位（第17位）标识asyncMode，第19位标识SHUTDOWN，第20位标识TERMINATED，第32位标识STOP（负数）
+     *
+     * saturate：
+     * 当线程将要在join或者ForkJoinPool.ManagedBlocker阻塞时，如果由于将达到maximumPoolSize
+     * 而无法发生替换，将引发RejectedExecutionException异常。但是如果该谓词非空，则会先对当前
+     * ForkJoinPool调用该谓词，如果返回true，则不会抛出异常而是以少于目标可运行数量的线程数运行
+     * 这可能无法保证进度。
+     */
     volatile long stealCount;            // collects worker nsteals
     final long keepAlive;                // milliseconds before dropping if idle
     int indexSeed;                       // next worker index
@@ -1319,6 +1410,7 @@ public class ForkJoinPool extends AbstractExecutorService {
      * Tries to construct and start one worker. Assumes that total
      * count has already been incremented as a reservation.  Invokes
      * deregisterWorker on any failure.
+     * 创建一个线程，并新绑定一个新增的任务队列，还会在任务池中找个空槽装入这个任务队列
      *
      * @return true if successful
      */
@@ -1366,41 +1458,74 @@ public class ForkJoinPool extends AbstractExecutorService {
      */
     final WorkQueue registerWorker(ForkJoinWorkerThread wt) {
         UncaughtExceptionHandler handler;
+        //将传入的线程设置为守护线程
         wt.setDaemon(true);                             // configure thread
         if ((handler = ueh) != null)
             wt.setUncaughtExceptionHandler(handler);
         int tid = 0;                                    // for thread name
+        //从池中获取asyncMode，除此位（第17位）之外，别的位都是0
         int idbits = mode & FIFO;
         String prefix = workerNamePrefix;
         WorkQueue w = new WorkQueue(this, wt);
         if (prefix != null) {
             synchronized (prefix) {
                 WorkQueue[] ws = workQueues; int n;
+                //根据原来的种子索引算得一个新的32位的种子索引
                 int s = indexSeed += SEED_INCREMENT;
+                /*
+                 * 计算种子索引（通过重置其中的各个标志位）,并与原来的idbits（只有第17位有意义）或操作得到idbits。某些特定位具备特殊含义
+                 * 满足：（FIFO标志继承池mode属性）
+                 * 1) 低16位为0，
+                 * 2) 第17位为0：后进先出
+                 * 3）第31位为0：非静止
+                 * 4）第32位为0：不需要等待唤醒
+                 * ~(SMASK | FIFO | DORMANT)高两位为0，低17位为0
+                 *
+                 * 可知最终idbits，高两位必为0，低16位必为0
+                 */
                 idbits |= (s & ~(SMASK | FIFO | DORMANT));
                 if (ws != null && (n = ws.length) > 1) {
                     int m = n - 1;
+                    //将种子索引处理为奇数，并安全取模（worker队列位于队列数组奇数索引处）。tid中的任何位都不具备特殊含义
                     tid = m & ((s << 1) | 1);           // odd-numbered indices
+                    //遍历所有的奇数槽，寻找一个空槽。tid从随机奇数槽开始，每次循环改变
                     for (int probes = n >>> 1;;) {      // find empty slot
                         WorkQueue q;
+                        //如果当前tid对应的槽为空，或者槽中队列为静止状态，则找到并退出
                         if ((q = ws[tid]) == null || q.phase == QUIET)
                             break;
+                        //遍历完所有奇数槽没找到满足条件的队列，tid设置为队列数组大小（偶数）加1.并会在后面马上扩容队列数组
                         else if (--probes == 0) {
                             tid = n | 1;                // resize below
                             break;
                         }
+                        //不满足上面两个结束条件，在一个奇数队列中（1，3，5，7..，m)从tid开始移动tid，以便遍历所有奇数槽
                         else
                             tid = (tid + 2) & m;
                     }
+                    /*
+                     * 已知tid必然小于2^30，（按道理来说tid应该是小于2^16的，这样下面的计算才有意义，
+                     * 因为idbits保证腾空的地方也是低16位）
+                     * 实际forkJoinPool初始化的时候限制了工作线程最大数量为2^15-1个，即MAX_CAP，所以tid按理也应该小于这个数
+                     * 当然，目前还没有找到明确的限制这个值的地方，后续队列数组扩容也没有找到限制大小的地方。
+                     *
+                     * 注意到，workQueue的id字段除了共享队列外也会记录工作队列的信息，但是每次记录只会发生在workQueue新增的时候
+                     * 只有phase会根据运行时状态发生更新，id不会发生更新（目前看来是这样的。。可能有误）
+                     */
                     w.phase = w.id = tid | idbits;      // now publishable
 
                     if (tid < n)
                         ws[tid] = w;
+                    //计算出的tid不在原队列数组，则数组扩容
                     else {                              // expand array
+                        //n最大值2^30,(2^31已经是负数了，n又必须是偶数)如果n已经是2^30则，an为负数，初始化数组会抛出异常
+                        //正常分析是会抛异常的，不知道是否漏掉啥细节了
                         int an = n << 1;
                         WorkQueue[] as = new WorkQueue[an];
+                        //此时原队列数组的对应槽本来就为空，不用担心被后续循环覆盖
                         as[tid] = w;
                         int am = an - 1;
+                        //队列数组扩容，这里可以看出，偶数槽（共享队列）最多64个，奇数槽（任务队列）没有限制
                         for (int j = 0; j < n; ++j) {
                             WorkQueue v;                // copy external queue
                             if ((v = ws[j]) != null)    // position may change
@@ -1440,11 +1565,13 @@ public class ForkJoinPool extends AbstractExecutorService {
                     if ((ws = workQueues) != null && (n = ws.length) > 0 &&
                         ws[i = wid & (n - 1)] == w)
                         ws[i] = null;
+                    //任务队列从队列池中彻底移除之前，保留一下偷窃数
                     stealCount += ns;
                 }
             }
             phase = w.phase;
         }
+        //如果任务队列中的驻留线程还没有退出
         if (phase != QUIET) {                         // else pre-adjusted
             long c;                                   // decrement counts
             do {} while (!CTL.weakCompareAndSet
@@ -1474,24 +1601,33 @@ public class ForkJoinPool extends AbstractExecutorService {
             long c; int sp; WorkQueue[] ws; int i; WorkQueue v;
             if ((c = ctl) >= 0L)                      // enough workers
                 break;
-            else if ((sp = (int)c) == 0) {            // no idle workers
-                if ((c & ADD_WORKER) != 0L)           // too few workers
+            else if ((sp = (int)c) == 0) {            // no idle workers 没有正在闲置的任务
+                if ((c & ADD_WORKER) != 0L)           // too few workers TC为负数，说明总工作线程数量过少，需要创建
                     tryAddWorker(c);
                 break;
             }
-            else if ((ws = workQueues) == null)
+            else if ((ws = workQueues) == null)       //任务队列数组为空，说明线程池未启动或已经终止
                 break;                                // unstarted/terminated
-            else if (ws.length <= (i = sp & SMASK))
+            else if (ws.length <= (i = sp & SMASK)) //拿到栈顶工作队列（线程）在池中的索引
                 break;                                // terminated
             else if ((v = ws[i]) == null)
                 break;                                // terminating
             else {
+                //准备唤醒ctl的栈顶线程
                 int np = sp & ~UNSIGNALLED;
                 int vp = v.phase;
                 long nc = (v.stackPred & SP_MASK) | (UC_MASK & (c + RC_UNIT));
                 Thread vt = v.owner;
+                /*
+                 * ctl的sp和ctl中栈顶队列的phase相等，且将ctl CAS更新为弹出栈顶队列后的效果成功
+                 * ctl栈顶指向原栈顶队列的前一个队列。即顺位第二最近被使用队列，活跃线程rc计数加一
+                 * 总体来说：
+                 * 如果当前工作队列是最近静止的或其工作者线程是最近阻塞的，则尝试恢复为静止之前的控制变量（回滚一下）
+                 */
                 if (sp == vp && CTL.compareAndSet(this, c, nc)) {
+                    //弹出原栈顶队列之后要更新原栈顶队列phase值，设置需要唤醒标志为0（此时phase变成了一个正数）
                     v.phase = np;
+                    //如果原栈顶队列的驻留线程非空且原栈顶队列偷取的目标队列为未唤醒
                     if (vt != null && v.source < 0)
                         LockSupport.unpark(vt);
                     break;
@@ -1515,74 +1651,106 @@ public class ForkJoinPool extends AbstractExecutorService {
      * return value indicates that the caller doesn't need to
      * re-adjust counts when later unblocked.
      *
+     *
+     * 这里的counts都是在说RC
+     * 因为这里释放一个线程，但是外面的任务队列线程最终会阻塞。如果外面的线程（调用tryCompensate方法的线程）原来就是阻塞状态，
+     * 那么RC加1没有问题。如果外面的线程原来不是阻塞状态，那么直到这个方法退出，RC都不应该加1.因为这个方法退出之后第一件事情就是
+     * 阻塞外面的线程（最终对冲调方法内部新增或释放的线程）。不过，要注意的是，如果外部线程阻塞结束之后，要将RC加1，意义就是把本方法
+     * 新增或释放的那个线程的计数补上（对冲结束）。
+     * 返回1：说明返回后要阻塞且调整
+     * 返回-1：说明返回后要阻塞
+     * 返回0: 说明需要重试
      * @return 1: block then adjust, -1: block without adjust, 0 : retry
      */
     private int tryCompensate(WorkQueue w) {
         int t, n, sp;
         long c = ctl;
         WorkQueue[] ws = workQueues;
+        //总常驻线程数量足够
         if ((t = (short)(c >>> TC_SHIFT)) >= 0) {
             if (ws == null || (n = ws.length) <= 0 || w == null)
                 return 0;                        // disabled
+            //阻塞队列有任务
             else if ((sp = (int)c) != 0) {       // replace or release
                 WorkQueue v = ws[sp & (n - 1)];
                 int wp = w.phase;
+                //如果给定任务队列之前在栈内：则RC计数加1 （tax‘mark）
+                //否则RC计数不变
                 long uc = UC_MASK & ((wp < 0) ? c + RC_UNIT : c);
                 int np = sp & ~UNSIGNALLED;
                 if (v != null) {
                     int vp = v.phase;
                     Thread vt = v.owner;
                     long nc = ((long)v.stackPred & SP_MASK) | uc;
+                    //弹出阻塞队列栈顶任务队列
                     if (vp == sp && CTL.compareAndSet(this, c, nc)) {
+                        //修改为栈外状态
                         v.phase = np;
+                        //如果弹出的任务队列的驻留线程在阻塞等唤醒， 就唤醒它
                         if (vt != null && v.source < 0)
                             LockSupport.unpark(vt);
+                        //阻塞队列弹出操作后，检查一下给定任务队列。
+                        // 如果之前在栈内返回-1：该方法返回阻塞结束之后不需要重新修改RC（在tax‘mark中已经加过一次了）
+                        // 如果之前在栈外返回1：该方法返回之后，且阻塞结束之后还需要重新修改RC，需要在外层把欠加的RC加回来
                         return (wp < 0) ? -1 : 1;
                     }
                 }
+                //如果阻塞队列没改变，返回0
                 return 0;
             }
+            //如果阻塞队列没任务（说明外部线程身是活跃的），且活跃线程过剩，那么减一下ctl对应数值，因为方法返回后外部线程阻塞
+            //如果修改ctl失败，需要在外部大循环中重试
             else if ((int)(c >> RC_SHIFT) -      // reduce parallelism
                      (short)(bounds & SMASK) > 0) {
                 long nc = ((RC_MASK & (c - RC_UNIT)) | (~RC_MASK & c));
                 return CTL.compareAndSet(this, c, nc) ? 1 : 0;
             }
+            //任务队列池中有任务没完成，但是阻塞队列中没有线程阻塞，而且活跃线程暂时不够
             else {                               // validate
                 int md = mode, pc = md & SMASK, tc = pc + t, bc = 0;
                 boolean unstable = false;
+                //遍历所有的工作队列
                 for (int i = 1; i < n; i += 2) {
                     WorkQueue q; Thread wt; Thread.State ts;
                     if ((q = ws[i]) != null) {
                         if (q.source == 0) {
+                            //有任务在scan中，可能正在消耗任务队列池中的任务，于是没有理由再释放新的线程来做活跃线程
                             unstable = true;
-                            break;
+                            break;//这里相当于return 0；
                         }
                         else {
+                            //如果遍历一遍tc不等于0，说明线程够用
                             --tc;
                             if ((wt = q.owner) != null &&
                                 ((ts = wt.getState()) == Thread.State.BLOCKED ||
                                  ts == Thread.State.WAITING))
+                                //正在阻塞的工作线程数量
                                 ++bc;            // worker is blocking
                         }
                     }
                 }
+                //ctl！=c说明阻塞队列已经被别的线程释放过
                 if (unstable || tc != 0 || ctl != c)
                     return 0;                    // inconsistent
                 else if (t + pc >= MAX_CAP || t >= (bounds >>> SWIDTH)) {
+                    //常驻线程过多
                     Predicate<? super ForkJoinPool> sat;
+                    //根据拒接策略判断是否在该方法中放行线程
                     if ((sat = saturate) != null && sat.test(this))
                         return -1;
                     else if (bc < pc) {          // lagging
+                        //常驻线程过多，活跃线程不够，阻塞中的工作线程小于并行系数。下面就让出cpu，给那些阻塞线程机会执行
                         Thread.yield();          // for retry spins
                         return 0;
                     }
                     else
+                        //如果阻塞的线程太多了，直接拒接本线程
                         throw new RejectedExecutionException(
                             "Thread limit exceeded replacing blocked worker");
                 }
             }
         }
-
+        //创建新线程
         long nc = ((c + TC_UNIT) & TC_MASK) | (c & ~TC_MASK); // expand pool
         return CTL.compareAndSet(this, c, nc) && createWorker() ? 1 : 0;
     }
@@ -1599,43 +1767,64 @@ public class ForkJoinPool extends AbstractExecutorService {
             if (scan(w, r)) {                     // scan until apparently empty
                 r ^= r << 13; r ^= r >>> 17; r ^= r << 5; // move (xorshift)
             }
+            //>>>>>>>>>>>>>>>>>>>>执行到这一步，说明完成了w的所有任务执行，w线程可以休眠<<<<<<<<<<<<<<<<<<<<<
+            //如果给定任务队列为已唤醒状态，将其放入未唤醒队列，并刷新ctl，然后接着扫描
             else if ((phase = w.phase) >= 0) {    // enqueue, then rescan
+                //递增phase版本号，设置phase为入栈状态
                 long np = (w.phase = (phase + SS_SEQ) | UNSIGNALLED) & SP_MASK;
                 long c, nc;
                 do {
                     w.stackPred = (int)(c = ctl);
+                    //减少一个活跃线程计数
                     nc = ((c - RC_UNIT) & UC_MASK) | np;
                 } while (!CTL.weakCompareAndSet(this, c, nc));
             }
+            //如果给定任务队列为入栈状态（根据上个if条件，此时w应该已经进入阻塞队列中了）
             else {                                // already queued
                 int pred = w.stackPred;
+                //清空中断标志，以允许阻塞（如果中断标志为设置状态，遇到阻塞会先清除中断标志再抛出异常）
                 Thread.interrupted();             // clear before park
+                //这里source不在表示正在偷取的队列索引，而是标志对任务队列w为静止状态可以被唤醒（特别之处是已经清空中断状态吗？）
+                //此时任务队列w还在阻塞队列栈顶，且任务队列w中应该没有任务了，（下面的操作是说w偷取目标等待被唤醒？）
                 w.source = DORMANT;               // enable signal
                 long c = ctl;
+                //rc=并行系数+ctl中的RC值
                 int md = mode, rc = (md & SMASK) + (int)(c >> RC_SHIFT);
+                //如果池状态为STOP即正在停止，直接退出
                 if (md < 0)                       // terminating
                     break;
+                //如果活跃线程数量没有超过预设并发系数，且池正在关闭，且关闭成功，停止成功。之后退出
                 else if (rc <= 0 && (md & SHUTDOWN) != 0 &&
                          tryTerminate(false, false))
                     break;                        // quiescent shutdown
+                //如果给定任务队列还在入栈状态
                 else if (w.phase < 0) {
+                    //如果活跃线程数少于预设阈值，且阻塞队列栈中还有别的线程，且给定任务为栈顶任务，
+                    // 则先阻塞给定任务队列一个keepAlive的随时间
                     if (rc <= 0 && pred != 0 && phase == (int)c) {
+                        //减少一个常驻线程，w退出阻塞队列栈顶
                         long nc = (UC_MASK & (c - TC_UNIT)) | (SP_MASK & pred);
                         long d = keepAlive + System.currentTimeMillis();
                         LockSupport.parkUntil(this, d);
+                        //如果在指定时间后，给定的任务没有被别的线程唤醒，则回滚等待栈，指向上一次入栈的等待线程，
+                        // 并将给定任务队列设置为静止状态（意味着任务队列中没有任务要执行，也退出了等待队列）
                         if (ctl == c &&           // drop on timeout if all idle
                             d - System.currentTimeMillis() <= TIMEOUT_SLOP &&
                             CTL.compareAndSet(this, c, nc)) {
                             w.phase = QUIET;
+                            //设置任务队列的phase为QUIET，【【且退出该任务队列的驻留线程】】
                             break;
                         }
                     }
+                    //阻塞当前工作者等待唤醒，ForkJoinPool 保证至少会有一个工作者线程不会退出（唤醒之后会先设置source为0再回到大循环继续执行）
                     else {
-                        LockSupport.park(this);
+                        LockSupport.park(this);//1-1
                         if (w.phase < 0)          // one spurious wakeup check
-                            LockSupport.park(this);
+                            LockSupport.park(this);//1-2
                     }
                 }
+                //如果在开放唤醒后真的被别的线程唤醒了phase>=0,或者1-1和1-2中的阻塞结束了，要重新开始执行runWorker。
+                // 那么此时线程已经是唤醒状态，不需要再被唤醒
                 w.source = 0;                     // disable signal
             }
         }
@@ -1650,19 +1839,27 @@ public class ForkJoinPool extends AbstractExecutorService {
     private boolean scan(WorkQueue w, int r) {
         WorkQueue[] ws; int n;
         if ((ws = workQueues) != null && (n = ws.length) > 0 && w != null) {
+            //遍历池中每一个任务队列
             for (int m = n - 1, j = r & m;;) {
                 WorkQueue q; int b;
+                //如果本次遍历所得任务队列非空（只要池中有任务队列中含任务，该方法就返回true）
                 if ((q = ws[j]) != null && q.top != (b = q.base)) {
                     int qid = q.id;
                     ForkJoinTask<?>[] a; int cap, k; ForkJoinTask<?> t;
+                    //本次任务队列中含有任务
                     if ((a = q.array) != null && (cap = a.length) > 0) {
+                        //获取本次任务队列的头部（base）任务
                         t = (ForkJoinTask<?>)QA.getAcquire(a, k = (cap - 1) & b);
+                        //本次任务队列头部未同时被别处修改，头部任务不为空，且置空头部任务成功
                         if (q.base == b++ && t != null &&
                             QA.compareAndSet(a, k, t, null)) {
+                            //头部指针加1
                             q.base = b;
+                            //设置给定任务队列偷取目标source为本次队列
                             w.source = qid;
+                            //如果更新后的本次任务队列的新头部有任务
                             if (a[(cap - 1) & b] != null)
-                                signalWork(q);    // help signal if more tasks
+                                signalWork(q);    // help signal if more tasks 根据情况唤醒或新建工作线程
                             w.topLevelExec(t, q,  // random fairness bound
                                            (r | (1 << TOP_BOUND_SHIFT)) & SMASK);
                         }
@@ -1690,20 +1887,40 @@ public class ForkJoinPool extends AbstractExecutorService {
      * @return task status on exit
      */
     final int awaitJoin(WorkQueue w, ForkJoinTask<?> task, long deadline) {
+        //join方法归属于task，但是awaitJoin归属于pool，初步判断是因为它需要pool的一些状态而task给不了
         int s = 0;
         int seed = ThreadLocalRandom.nextSecondarySeed();
+        /*
+         * if(A) { if(B) {C} } else {C}  == if(!A || B) {C} 否或技巧
+         */
+        /*
+         *  工作队列不为 null && 任务不为 null
+         *  1）task 不是 CountedCompleter 任务（可继续执行）
+         *  2）task 是 CountedCompleter，则尝试窃取和执行目标计算中的任务，直到其完成或无法找到任务为止
+         *  3）task 是CountedCompleter任务且没执行成功（可继续执行）
+         */
         if (w != null && task != null &&
             (!(task instanceof CountedCompleter) ||
              (s = w.helpCC((CountedCompleter<?>)task, 0, false)) >= 0)) {
+            //在任务队列中移除并执行目标task（执行不完没关系，主要是移出来）
             w.tryRemoveAndExec(task);
             int src = w.source, id = w.id;
+            //r为奇数，步长为偶数，那么可以得到一个奇数序列
             int r = (seed >>> 16) | 1, step = (seed & ~1) | 2;
             s = task.status;
+            //直到task完成为止
             while (s >= 0) {
                 WorkQueue[] ws;
                 int n = (ws = workQueues) == null ? 0 : ws.length, m = n - 1;
+                //n在循环内递减
                 while (n > 0) {
                     WorkQueue q; int b;
+                    /**
+                     *  目标索引 r & m定位到的工作队列不为 null   &&
+                     *  此工作队列最近窃取了当前工作队列的任务 &&
+                     *  此工作队列有任务待处理 &&
+                     *  则帮助其处理任务
+                     */
                     if ((q = ws[r & m]) != null && q.source == id &&
                         q.top != (b = q.base)) {
                         ForkJoinTask<?>[] a; int cap, k;
@@ -1755,23 +1972,35 @@ public class ForkJoinPool extends AbstractExecutorService {
     final void helpQuiescePool(WorkQueue w) {
         int prevSrc = w.source;
         int seed = ThreadLocalRandom.nextSecondarySeed();
+        //步长必须是奇数（如果是偶数，那步增无法改变奇偶性）
         int r = seed >>> 16, step = r | 1;
+
+        //只有后面的quiet判断满足的时候才会跳出这个循环；
+        // released标志了本线程在活跃工作线程这个身份上反复横跳（这个解释可能是错的）
         for (int source = prevSrc, released = -1;;) { // -1 until known
             ForkJoinTask<?> localTask; WorkQueue[] ws;
+            //先把给定任务队列中的任务造完
             while ((localTask = w.nextLocalTask()) != null)
                 localTask.doExec();
+
+
             if (w.phase >= 0 && released == -1)
                 released = 1;
             boolean quiet = true, empty = true;
             int n = (ws = workQueues) == null ? 0 : ws.length;
+
+            //随机抽取任务队列池中 一个任务队列，直到取得一个非空任务队列
             for (int m = n - 1; n > 0; r += step, --n) {
                 WorkQueue q; int b;
                 if ((q = ws[r & m]) != null) {
                     int qs = q.source;
+                    //如果任务队列q非空，且有未完成任务
                     if (q.top != (b = q.base)) {
+                        //1）任务队列非空，且有未完成任务，则quiet设置为false
                         quiet = empty = false;
                         ForkJoinTask<?>[] a; int cap, k;
                         int qid = q.id;
+                        //随机搞到的任务队列中有任务，获取（偷）任务队列头base任务
                         if ((a = q.array) != null && (cap = a.length) > 0) {
                             if (released == 0) {    // increment
                                 released = 1;
@@ -1789,17 +2018,22 @@ public class ForkJoinPool extends AbstractExecutorService {
                         }
                         break;
                     }
+                    //执行到这一步，后面还得继续循环找任务队列
+                    //2）任务队列q非空，任务数组为空，且任务队列source字段不为QUIET
                     else if ((qs & QUIET) == 0)
                         quiet = false;
                 }
             }
             if (quiet) {
+                //3）只要随机抽取中有一个非空且含任务的任务队列，就不会执行到这里
+                //   只要随机抽取中遇到所有任务队列非空且不含任务且不全是QUIET，就不会执行到这里
                 if (released == 0)
                     CTL.getAndAdd(this, RC_UNIT);
                 w.source = prevSrc;
                 break;
             }
             else if (empty) {
+                //4）只要随机抽取中有一个非空且含任务的任务队列，就不会执行到这里，否则就会执行到这里
                 if (source != QUIET)
                     w.source = source = QUIET;
                 if (released == 1) {                 // decrement
@@ -1886,28 +2120,40 @@ public class ForkJoinPool extends AbstractExecutorService {
             WorkQueue q;
             int md = mode, n;
             WorkQueue[] ws = workQueues;
+            //如果线程池在SHUTDOWN过程中，或者任务队列数组为空则抛出特定异常
             if ((md & SHUTDOWN) != 0 || ws == null || (n = ws.length) <= 0)
                 throw new RejectedExecutionException();
+            //计算r对应的安全索引对应的任务队列为空
+            //添加一个任务队列
             else if ((q = ws[(n - 1) & r & SQMASK]) == null) { // add queue
+                //qid为不安全的r通过配置一些状态位计算得到；
+                // qid必然为偶数，qid代表的队列为共享队列,满足队列静止，先进后出FILO
+                // (n - 1) & r & SQMASK 和 qid 实际上是一致的，这也意味着后面的i对应的槽应该也是空
                 int qid = (r | QUIET) & ~(FIFO | OWNED);
                 Object lock = workerNamePrefix;
                 ForkJoinTask<?>[] qa =
                     new ForkJoinTask<?>[INITIAL_QUEUE_CAPACITY];
+                //下面就是初始化共享队列
                 q = new WorkQueue(this, null);
                 q.array = qa;
                 q.id = qid;
+                //此时phase为默认值0，表示共享队列未上锁；source为QUIET表示偷取对象（未绑定线程，且没任务）->（存疑）
                 q.source = QUIET;
                 if (lock != null) {     // unless disabled, lock pool to install
                     synchronized (lock) {
                         WorkQueue[] vs; int i, vn;
+                        //SQMASK为64个偶数槽中数值最大的槽126
+                        //如果别的线程已经添加了一个任务队列，那本线程就不继续添加了
                         if ((vs = workQueues) != null && (vn = vs.length) > 0 &&
                             vs[i = qid & (vn - 1) & SQMASK] == null)
                             vs[i] = q;  // else another thread already installed
                     }
                 }
             }
+            //尝试锁住r计算获得，或新建的任务队列，如果失败则重置r接着拿新的任务队列
             else if (!q.tryLockPhase()) // move if busy
                 r = ThreadLocalRandom.advanceProbe(r);
+            //锁住了获得的任务队列，
             else {
                 if (q.lockedPush(task))
                     signalWork(null);
@@ -2048,12 +2294,16 @@ public class ForkJoinPool extends AbstractExecutorService {
      *
      * @param now if true, unconditionally terminate, else only
      * if no work and no active workers
+     *            true：表示无条件终止
+     *            false：表示线程池无任务或无活跃工作者线程之后终止
      * @param enable if true, terminate when next possible
      * @return true if terminating or terminated
      */
     private boolean tryTerminate(boolean now, boolean enable) {
         int md; // 3 phases: try to set SHUTDOWN, then STOP, then TERMINATED
 
+        //如果线程池还没有进入SHUTDOWN阶段，且满足enable为false和当前线程池为公共线程池中的一个条件，则终止失败
+        //否则设置SHUTDOWN标志直到成功
         while (((md = mode) & SHUTDOWN) == 0) {
             if (!enable || this == common)        // cannot shutdown
                 return false;
@@ -2061,42 +2311,60 @@ public class ForkJoinPool extends AbstractExecutorService {
                 MODE.compareAndSet(this, md, md | SHUTDOWN);
         }
 
+        //如果线程池还没有进入STOP阶段
         while (((md = mode) & STOP) == 0) {       // try to initiate termination
+            //如果需要等待队列静止及任务为空
             if (!now) {                           // check if quiescent & empty
                 for (long oldSum = 0L;;) {        // repeat until stable
                     boolean running = false;
                     long checkSum = ctl;
                     WorkQueue[] ws = workQueues;
+                    //1）活跃线程数大于预期活跃线程数，则设置running为true
                     if ((md & SMASK) + (int)(checkSum >> RC_SHIFT) > 0)
                         running = true;
+                    //2）活跃线程数已经少于并行系数但池中还有任务队列
                     else if (ws != null) {
                         WorkQueue w;
+                        //遍历池中所有任务队列
                         for (int i = 0; i < ws.length; ++i) {
                             if ((w = ws[i]) != null) {
                                 int s = w.source, p = w.phase;
                                 int d = w.id, b = w.base;
+                                //如果遍历本次任务队列有任务或者【队列是工作队列（非共享队列）且未阻塞或偷取目标未阻塞】
+                                //说明还有任务队列在执行，或者正在扫描或者有工作未完成，则设置running为true并跳出
                                 if (b != w.top ||
                                     ((d & 1) == 1 && (s >= 0 || p >= 0))) {
                                     running = true;
                                     break;     // working, scanning, or have work
                                 }
+                                /*要满足计算式为0，需要for循环中每个子checkSum都为0：
+                                 * 1）任务队列数组的每一个非空任务队列没有在偷任务
+                                 * 2）任务队列数组的每一个非空任务为共享队列且未上锁
+                                 * 3）任务队列数组的每一个非空任务id为0
+                                 * 4）任务队列数组的每一个非空任务base为0
+                                 */
                                 checkSum += (((long)s << 48) + ((long)p << 32) +
                                              ((long)b << 16) + (long)d);
                             }
                         }
                     }
+                    //在别的线程中线程池已经提前进入STOP阶段，那么本线程可以跳出循环
                     if (((md = mode) & STOP) != 0)
                         break;                 // already triggered
+                    //如果还有很多活跃线程，或者存在一个及以上活跃任务，则终止失败
                     else if (running)
                         return false;
+                    //这里会不停地循环，直到checkSum四个部分都为0为止
                     else if (workQueues == ws && oldSum == (oldSum = checkSum))
                         break;
                 }
             }
+            //线程池进入STOP阶段
             if ((md & STOP) == 0)
                 MODE.compareAndSet(this, md, md | STOP);
         }
 
+        //如果线程池还没有进入TERMINATED阶段
         while (((md = mode) & TERMINATED) == 0) { // help terminate others
             for (long oldSum = 0L;;) {            // repeat until stable
                 WorkQueue[] ws; WorkQueue w;
@@ -2105,13 +2373,17 @@ public class ForkJoinPool extends AbstractExecutorService {
                     for (int i = 0; i < ws.length; ++i) {
                         if ((w = ws[i]) != null) {
                             ForkJoinWorkerThread wt = w.owner;
+                            //取消所有任务
                             w.cancelAll();        // clear queues
+                            //如果是工作队列
                             if (wt != null) {
                                 try {             // unblock join or park
+                                    //中断工作者线程（如果处于join或者park阻塞中，则会解除阻塞）
                                     wt.interrupt();
                                 } catch (Throwable ignore) {
                                 }
                             }
+                            //累加校验和
                             checkSum += ((long)w.phase << 32) + w.base;
                         }
                     }
@@ -2120,12 +2392,16 @@ public class ForkJoinPool extends AbstractExecutorService {
                     (workQueues == ws && oldSum == (oldSum = checkSum)))
                     break;
             }
+            //如果别的线程捷足先登，抢先一步设置TERMINATED状态，则退出
             if ((md & TERMINATED) != 0)
                 break;
+            //如果实际常驻线程比较多，则直接退出
             else if ((md & SMASK) + (short)(ctl >>> TC_SHIFT) > 0)
                 break;
+            //执行到这里就可以设置TERMINATED状态了
             else if (MODE.compareAndSet(this, md, md | TERMINATED)) {
                 synchronized (this) {
+                    //在awaitTermination操作中有些线程在阻塞等待，调用下面方法会提前唤醒它并校验终止标志
                     notifyAll();                  // for awaitTermination
                 }
                 break;
@@ -2307,12 +2583,20 @@ public class ForkJoinPool extends AbstractExecutorService {
             throw new NullPointerException();
         long ms = Math.max(unit.toMillis(keepAliveTime), TIMEOUT_SLOP);
 
+        //核心池大小的安全表示（客户传入的corePoolSize值可能范围不安全）
         int corep = Math.min(Math.max(corePoolSize, parallelism), MAX_CAP);
         long c = ((((long)(-corep)       << TC_SHIFT) & TC_MASK) |
                   (((long)(-parallelism) << RC_SHIFT) & RC_MASK));
         int m = parallelism | (asyncMode ? FIFO : 0);
+        //储备线程数：除去并发系数外还能创建的线程数量（一个创建上限类型的值）
         int maxSpares = Math.min(maximumPoolSize, MAX_CAP) - parallelism;
+        //最小的可用线程数，minimumRunnable的安全表示（客户传入的mimimumRunnable值可能范围不安全）
         int minAvail = Math.min(Math.max(minimumRunnable, 0), MAX_CAP);
+        /*
+         * 低16位表示除开并行系数外至少应该有的线程数（为了满足最小可用限制）
+         * 高16位表示除开并行系数外最大可创建线程数
+         * 该处为forkJoinPool的bounds值初始化位置，后续应该根据线程创建销毁动态维护
+         */
         int b = ((minAvail - parallelism) & SMASK) | (maxSpares << SWIDTH);
         int n = (parallelism > 1) ? parallelism - 1 : 1; // at least 2 slots
         n |= n >>> 1; n |= n >>> 2; n |= n >>> 4; n |= n >>> 8; n |= n >>> 16;

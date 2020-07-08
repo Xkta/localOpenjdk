@@ -254,7 +254,9 @@ public abstract class ForkJoinTask<V> implements Future<V>, Serializable {
     private int setDone() {
         int s;
         if (((s = (int)STATUS.getAndBitwiseOr(this, DONE)) & SIGNAL) != 0)
+            //如果没有异常
             synchronized (this) { notifyAll(); }
+        //返回status（设置为已完成）
         return s | DONE;
     }
 
@@ -390,6 +392,20 @@ public abstract class ForkJoinTask<V> implements Future<V>, Serializable {
      */
     private int doJoin() {
         int s; Thread t; ForkJoinWorkerThread wt; ForkJoinPool.WorkQueue w;
+
+        /*
+         * 如果当前任务已执行完，直接返回status
+         * 否则：
+         * if (当前线程是ForkJoinWorkerThread线程）{
+         *      if（任务在任务队列头部也就是top位置 && 执行当前任务成功）{
+         *          return 执行结果（status）;
+         *      } else {
+         *          调用任务队列池的awaitJoin方法；
+         *      }
+         * } else {
+         *      执行externalAwaitDone()；
+         * }
+         */
         return (s = status) < 0 ? s :
             ((t = Thread.currentThread()) instanceof ForkJoinWorkerThread) ?
             (w = (wt = (ForkJoinWorkerThread)t).workQueue).
