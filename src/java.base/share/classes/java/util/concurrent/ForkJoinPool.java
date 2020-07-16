@@ -1881,6 +1881,8 @@ public class ForkJoinPool extends AbstractExecutorService {
      * produced by one of w's stealers; compensating and blocking if
      * none are found (rescanning if tryCompensate fails).
      *
+     * 帮助小偷执行它的任务，且/或阻塞当前线程给定的时间直到给定的任务完成或者超时（让小偷去执行）。
+     *
      * @param w caller
      * @param task the task
      * @param deadline for timed waits, if nonzero
@@ -1908,11 +1910,11 @@ public class ForkJoinPool extends AbstractExecutorService {
             //r为奇数，步长为偶数，那么可以得到一个奇数序列
             int r = (seed >>> 16) | 1, step = (seed & ~1) | 2;
             s = task.status;
-            //直到task完成为止
+            //直到task完成为止，不然会一直偷，一直阻塞执行
             while (s >= 0) {
                 WorkQueue[] ws;
                 int n = (ws = workQueues) == null ? 0 : ws.length, m = n - 1;
-                //n在循环内递减
+                //n在循环内递减（找到偷自己任务的任务队列，如果它要帮忙就帮忙再退出，否则在有限次数后也会退出）
                 while (n > 0) {
                     WorkQueue q; int b;
                     /**
@@ -1943,18 +1945,26 @@ public class ForkJoinPool extends AbstractExecutorService {
                         --n;
                     }
                 }
+                //如果任务已完成，就退出
                 if ((s = task.status) < 0)
                     break;
+                //如果任务队列池没有任务，或者在偷本任务队列的小偷没有任务（也就是本线程没有偷到任务）
                 else if (n == 0) { // empty scan
                     long ms, ns; int block;
+                    // 1）非超时模式
                     if (deadline == 0L)
                         ms = 0L;                       // untimed
+                    // 2）如果已经超时，则返回
                     else if ((ns = deadline - System.nanoTime()) <= 0L)
                         break;                         // timeout
+                    // 3）未超时，但是剩余时间 < 1 毫秒，则将其设置为 1 毫秒
                     else if ((ms = TimeUnit.NANOSECONDS.toMillis(ns)) <= 0L)
                         ms = 1L;                       // avoid 0 for timed wait
+                    // 尝试增加一个补偿工作者来处理任务
                     if ((block = tryCompensate(w)) != 0) {
+                        // 阻塞等待
                         task.internalWait(ms);
+                        // 如果添加成功，则递增活跃工作者数
                         CTL.getAndAdd(this, (block > 0) ? RC_UNIT : 0L);
                     }
                     s = task.status;

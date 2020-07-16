@@ -239,6 +239,8 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      * The maximum capacity, used if a higher value is implicitly specified
      * by either of the constructors with arguments.
      * MUST be a power of two <= 1<<30.
+     *
+     * 如果构造函数传入比本值更大的值，就用本值来替换。作为一个满足2幂的最大int值。
      */
     static final int MAXIMUM_CAPACITY = 1 << 30;
 
@@ -336,6 +338,13 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      */
     static final int hash(Object key) {
         int h;
+        /*
+         * 扰动算法：
+         * key的哈希码高16位与低16位异或（扰动算法的一种），主要是因为后续要对哈希表长度取模，到时候低位随机性会受影响
+         * 这里将高低位异或，引入高位随机性以减少取模随机性（来自高位的）丢失。以前是扰动四次，可能考虑到
+         * 扰动四次和一次没太大区别，现在只扰动一次。
+         */
+
         return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
     }
 
@@ -348,8 +357,11 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             Class<?> c; Type[] ts, as; ParameterizedType p;
             if ((c = x.getClass()) == String.class) // bypass checks
                 return c;
+            //获取x的接口Type数组
             if ((ts = c.getGenericInterfaces()) != null) {
                 for (Type t : ts) {
+                    //有泛型Type接口（Comparable<C>)，且该Type原始类型为Comparable，且该Type的泛型列表长度为1（只有一个泛型）
+                    //且泛型类型和对象x类型一样
                     if ((t instanceof ParameterizedType) &&
                         ((p = (ParameterizedType) t).getRawType() ==
                          Comparable.class) &&
@@ -376,6 +388,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      * Returns a power of two size for the given target capacity.
      */
     static final int tableSizeFor(int cap) {
+        //ForkJoinPool中初始化池大小有类似的算法
+        //高位全是1，低位全是0，且1的数量等于（cap-1）中高位连续0的数量；这么做是为了算出最小大于（cap-1）
+        // （可以等于cap，这就是为啥要减一）的二次幂
         int n = -1 >>> Integer.numberOfLeadingZeros(cap - 1);
         return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
     }
@@ -496,12 +511,21 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         int s = m.size();
         if (s > 0) {
             if (table == null) { // pre-size
+                /*
+                 * 如果原表为空，计算并设置阈值（实际上这里设置的thredhold都是作为容量使用，已经不是thredhold的默认含义了）
+                 * (这个地方的thredshold会在数组初始化的时候用到，到时候它会作为初始化容量，并重新计算阈值）
+                 */
                 float ft = ((float)s / loadFactor) + 1.0F;
                 int t = ((ft < (float)MAXIMUM_CAPACITY) ?
                          (int)ft : MAXIMUM_CAPACITY);
                 if (t > threshold)
                     threshold = tableSizeFor(t);
             } else {
+                /*
+                 * 如果原表有数据，且给定map参数中所含元素大于原表阈值，则resize原hashMap一次。
+                 * 因为resize中list分裂的限制，一次只能分裂成两个，我们无法一次性扩展出所有的槽来装载新元素。
+                 * 但是我们可以先在这里resize（2倍原容量）一次来减少putVal的压力。
+                 */
                 // Because of linked-list bucket constraints, we cannot
                 // expand all at once, but can reduce total resize
                 // effort by repeated doubling now vs later
@@ -624,13 +648,29 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      */
     final V putVal(int hash, K key, V value, boolean onlyIfAbsent,
                    boolean evict) {
+        /*
+         * 如果当前map中table为空，则resize一下
+         * 设置tab为当前table，n为当前table大小
+         */
         Node<K,V>[] tab; Node<K,V> p; int n, i;
         if ((tab = table) == null || (n = tab.length) == 0)
             n = (tab = resize()).length;
+
         if ((p = tab[i = (n - 1) & hash]) == null)
+            //1. hash取模算出下标，如果没有发生哈希冲突，则新建一个Node放入table数组对应位置
             tab[i] = newNode(hash, key, value, null);
         else {
+            //2. 发生了哈希冲突
             Node<K,V> e; K k;
+            /*
+             * p为发生冲突的原节点
+             *
+             * a。p为孤点：如果发生哈希冲突的节点与当前传入的节点满足：1.哈希值一样 2.键值不为空 3.键值一样，【1】则将p写入e。
+             * b。p为树节点：如果发起冲突的节点为树节点类型，则调用树节点的putTreeVal方法，【2】并将方法返回值写入e
+             * c。p为链节点：如果a，b都不满足，则从p开始遍历链：
+             *      c-1：如果链中有等价节点（键值和哈希值都等于传入值），【3】则将该等价节点写入e。
+             *      c-2：如果链中没有等价节点，则将null写入e，并创建新节点放入链尾。
+             */
             if (p.hash == hash &&
                 ((k = p.key) == key || (key != null && key.equals(k))))
                 e = p;
@@ -650,10 +690,13 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     p = e;
                 }
             }
+            //存在一摸一样的映射（hash相同key相同),对应【1】【2】【3】三处。相同的映射对应节点已经被放入e中。
             if (e != null) { // existing mapping for key
                 V oldValue = e.value;
+                //如果允许覆写或原值为空，则覆盖原节点中的value。
                 if (!onlyIfAbsent || oldValue == null)
                     e.value = value;
+                //调一下钩子方法
                 afterNodeAccess(e);
                 return oldValue;
             }
@@ -679,6 +722,17 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         int oldCap = (oldTab == null) ? 0 : oldTab.length;
         int oldThr = threshold;
         int newCap, newThr = 0;
+        /*
+         * 1. 计算新表容量newCap及新表阈值newThr
+         * 1）旧表有元素：
+         *      如果旧表容量已达上限，用最大整值覆盖阈值并【4】【c】直接返回旧表；
+         *      否则，先设置【1】新表容量newCap为2倍旧值，(可能新阈值重新计算)
+         *          如果改完之后newCap未超过最大值及oldCap未小于最小限制，【a】设置新表阈值newThr为旧值2倍
+         * 2）旧表无元素，且阈值已设置：
+         *      则【2】新表容量newCap初始化为旧表阈值，新阈值会重新计算。
+         * 3）旧表无元素，且阈值未设置：
+         *      则【3】新表容量newCap为默认值，【b】设置新表阈值newThr为默认值
+         */
         if (oldCap > 0) {
             if (oldCap >= MAXIMUM_CAPACITY) {
                 threshold = Integer.MAX_VALUE;
@@ -694,15 +748,33 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             newCap = DEFAULT_INITIAL_CAPACITY;
             newThr = (int)(DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY);
         }
+
+        //如果上述方法无法计算newThr，这里需要再次补充计算（除了【a】【b】【c】之外都进这里）
+        //根据新表大小计算阈值，newThr设置为该阈值或最大值。
         if (newThr == 0) {
             float ft = (float)newCap * loadFactor;
             newThr = (newCap < MAXIMUM_CAPACITY && ft < (float)MAXIMUM_CAPACITY ?
                       (int)ft : Integer.MAX_VALUE);
         }
+        /*
+         * 2. 根据newThr设置阈值，根据newCap初始化新表
+         */
         threshold = newThr;
         @SuppressWarnings({"rawtypes","unchecked"})
         Node<K,V>[] newTab = (Node<K,V>[])new Node[newCap];
         table = newTab;
+        /*
+         * 3. 将旧表内容拷贝到新表（重新hash）
+         * 遍历原表所有元素：
+         *      1）如果当前元素没发生哈希冲突（next==null）：
+         *          hash取模重新计算新数组位置，并将其放入新数组
+         *      2）如果当前元素发生了哈希冲突，且树化：
+         *          调用TreeNode的split方法
+         *      3）如果当前元素发生了哈希冲突，且链化：
+         *          由于根据新的数组容量取模会影响链中元素的数组归属下标，这里需要将原链拆分为两个新链（会保留旧链顺序）
+         *          a) lo标志的低链复用原来的数组下标j
+         *          b）hi标志的高链使用新的数组下标（j+oldCap）
+         */
         if (oldTab != null) {
             for (int j = 0; j < oldCap; ++j) {
                 Node<K,V> e;
@@ -712,7 +784,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                         newTab[e.hash & (newCap - 1)] = e;
                     else if (e instanceof TreeNode)
                         ((TreeNode<K,V>)e).split(this, newTab, j, oldCap);
-                    else { // preserve order
+                    else { // preserve order 保留顺序
                         Node<K,V> loHead = null, loTail = null;
                         Node<K,V> hiHead = null, hiTail = null;
                         Node<K,V> next;
@@ -1876,6 +1948,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
         /**
          * Ensures that the given root is the first node of its bin.
+         * 将给定的root节点移动到它所在的槽的第一个位置
          */
         static <K,V> void moveRootToFront(Node<K,V>[] tab, TreeNode<K,V> root) {
             int n;
@@ -1886,13 +1959,18 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     Node<K,V> rn;
                     tab[index] = root;
                     TreeNode<K,V> rp = root.prev;
+                    //root原来后序节点前指向root原来前序节点
                     if ((rn = root.next) != null)
                         ((TreeNode<K,V>)rn).prev = rp;
+                    //root原来的前序节点后指向root原来的后续节点
                     if (rp != null)
                         rp.next = rn;
+                    //将槽中原来第一个节点前指向root
                     if (first != null)
                         first.prev = root;
+                    //root后指向原槽中第一个节点
                     root.next = first;
+                    //root的前指针置为空，标志root为槽中新的第一个节点
                     root.prev = null;
                 }
                 assert checkInvariants(root);
@@ -1922,7 +2000,10 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 else if ((kc != null ||
                           (kc = comparableClassFor(k)) != null) &&
                          (dir = compareComparables(kc, k, pk)) != 0)
+                    //用object的比较方法不好使，就用给定的kc比较方法来比较
+                    //确保kc不为空且给定键k，当前键pk在规定的比较类kc下可比较，并设置比较结果为dir
                     p = (dir < 0) ? pl : pr;
+                //如果到这里，说明不知道该左转还是右转，（只使用一个递归可能是为了减少方法栈压力）
                 else if ((q = pr.find(h, k, kc)) != null)
                     return q;
                 else
@@ -1932,7 +2013,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         }
 
         /**
-         * Calls find for root node.
+         * Calls find for root node.(从根节点开始找，如果当前节点的父节点为空，那么当前节点就是根节点）
          */
         final TreeNode<K,V> getTreeNode(int h, Object k) {
             return ((parent != null) ? root() : this).find(h, k, null);
@@ -1944,6 +2025,11 @@ public class HashMap<K,V> extends AbstractMap<K,V>
          * order, just a consistent insertion rule to maintain
          * equivalence across rebalancings. Tie-breaking further than
          * necessary simplifies testing a bit.
+         * 用这个方法来比较两个对象，返回值要么大于0，要么小于0，不会为0
+         * 也就是说这一步一定能确定要插入的节点要么是树的左节点，要么是右节点，不然就无法继续满足二叉树结构了
+         *
+         * 先比较两个对象的类名，类名是字符串对象，就按字符串的比较规则
+         * 如果两个对象是同一个类型，那么调用本地方法为两个对象生成hashCode值，再进行比较，hashCode相等的话返回-1
          */
         static int tieBreakOrder(Object a, Object b) {
             int d;
@@ -1972,6 +2058,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     K k = x.key;
                     int h = x.hash;
                     Class<?> kc = null;
+                    //BST插入一个元素，并且调用重平衡方法
                     for (TreeNode<K,V> p = root;;) {
                         int dir, ph;
                         K pk = p.key;
@@ -2236,6 +2323,8 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
         static <K,V> TreeNode<K,V> rotateLeft(TreeNode<K,V> root,
                                               TreeNode<K,V> p) {
+            //参数root传入旧的根节点，返回新的根节点，如果在旋转之后新的最高节点父亲为空，则新的最高节点为根节点
+            //并将根节点写入root返回。如果新的二项（旋转两端）根为树根，那么设置它的颜色为黑色。
             TreeNode<K,V> r, pp, rl;
             if (p != null && (r = p.right) != null) {
                 if ((rl = p.right = r.left) != null)
@@ -2274,6 +2363,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                                                     TreeNode<K,V> x) {
             x.red = true;
             for (TreeNode<K,V> xp, xpp, xppl, xppr;;) {
+
                 if ((xp = x.parent) == null) {
                     x.red = false;
                     return x;

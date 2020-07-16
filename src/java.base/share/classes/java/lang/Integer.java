@@ -1639,10 +1639,11 @@ public final class Integer extends Number
      */
     @HotSpotIntrinsicCandidate
     public static int numberOfLeadingZeros(int i) {
-        // HD, Count leading 0's
+        // HD, Count leading 0's（该算法来自《Hacker's Delight》学名算法心得这本书，体现了朴素的二分思想）
         if (i <= 0)
             return i == 0 ? 32 : 0;
         int n = 31;
+        //说明i的低16位等价于全是1.所以预期的31个0要减16；然后无符号右移i，开始计算高16位中1的个数
         if (i >= 1 << 16) { n -= 16; i >>>= 16; }
         if (i >= 1 <<  8) { n -=  8; i >>>=  8; }
         if (i >= 1 <<  4) { n -=  4; i >>>=  4; }
