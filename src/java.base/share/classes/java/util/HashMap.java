@@ -2362,8 +2362,25 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         static <K,V> TreeNode<K,V> balanceInsertion(TreeNode<K,V> root,
                                                     TreeNode<K,V> x) {
             x.red = true;
+            /**
+             * 通过for循环完成双红冲突的向上传递，通过祖父的左右子树指针，完成对叔父节点左右位置的判断
+             * 以上两点都是在插入流程中依赖的非常重要的两个条件。
+             * 所有的操作都在向唯二的两个return靠拢。也就是一直在尝试退化成最简单的情况。
+             * BST插入完成后调整流程：
+             * 1. 如果插入节点成为了根节点，那么设置为黑色，完成退出返回插入节点为根节点。
+             * 2. 如果插入节点父节点为黑色或根节点，那么退出返回原根节点（参数中传入）。
+             * 3. 如果插入节点父节点为红色（冲突来了）
+             *      a). 叔父节点在右（父节点在左）：
+             *          i). 叔父节点不为空，颜色为红色，则三阶拆成两个一阶，祖父节点上升（祖父节点黑变红成为新的x）准备提高上层阶数。
+             *          ii). 叔父节点为空（由于父节点高度为0，所以叔父节点为黑色的情况不用分析）
+             *              由于原祖父节点的子树高度都为0，只需要调整一下，新子树高度继续为0就行
+             *              1）插入节点在右：当前结构由<旋转成/之后重新循环（这里父，插入节点都是红色，所以无色变化）
+             *              2) 插入节点在左（已经是/型结构）: 先呼唤父节点和祖父节点颜色，再对祖父节点右旋达到稳定，
+             *                （第二次循环会识别出稳定，并退出返回对应的根节点）
+             *      b). 叔父节点在左（父节点在右）：镜像操作
+             */
             for (TreeNode<K,V> xp, xpp, xppl, xppr;;) {
-
+                //xp，xppl，xppr在使用之前都会重新初始化，但是xpp不一定
                 if ((xp = x.parent) == null) {
                     x.red = false;
                     return x;
@@ -2379,7 +2396,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     }
                     else {
                         if (x == xp.right) {
+                            //<型构造旋转成/型构造，并将新底部作为x重新进入循环
                             root = rotateLeft(root, x = xp);
+                            //给xp和xpp两个指针赋值
                             xpp = (xp = x.parent) == null ? null : xp.parent;
                         }
                         if (xp != null) {
