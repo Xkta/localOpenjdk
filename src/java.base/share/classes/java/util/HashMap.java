@@ -666,7 +666,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
              * p为发生冲突的原节点
              *
              * a。p为孤点：如果发生哈希冲突的节点与当前传入的节点满足：1.哈希值一样 2.键值不为空 3.键值一样，【1】则将p写入e。
-             * b。p为树节点：如果发起冲突的节点为树节点类型，则调用树节点的putTreeVal方法，【2】并将方法返回值写入e
+             * b。p为树节点：如果发起冲突的节点为树节点类型，则调用树节点的putTreeVal方法，
+             *      b-1: 如果树中有等价节点【2】并将方法返回值写入e
+             *      b-2: 如果树中没有等价节点，则将null写入e，并创建树节点放入树中，再平衡，且维护链指针。
              * c。p为链节点：如果a，b都不满足，则从p开始遍历链：
              *      c-1：如果链中有等价节点（键值和哈希值都等于传入值），【3】则将该等价节点写入e。
              *      c-2：如果链中没有等价节点，则将null写入e，并创建新节点放入链尾。
@@ -696,7 +698,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 //如果允许覆写或原值为空，则覆盖原节点中的value。
                 if (!onlyIfAbsent || oldValue == null)
                     e.value = value;
-                //调一下钩子方法
+                //调一下钩子方法（只有在插入时出现相同映射才会调用的方法）
                 afterNodeAccess(e);
                 return oldValue;
             }
@@ -768,7 +770,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
          * 遍历原表所有元素：
          *      1）如果当前元素没发生哈希冲突（next==null）：
          *          hash取模重新计算新数组位置，并将其放入新数组
-         *      2）如果当前元素发生了哈希冲突，且树化：
+         *      2）如果当前元素发生了哈希冲突，且是在树中（说明有元素在这里折叠过，需要split展开）：
          *          调用TreeNode的split方法
          *      3）如果当前元素发生了哈希冲突，且链化：
          *          由于根据新的数组容量取模会影响链中元素的数组归属下标，这里需要将原链拆分为两个新链（会保留旧链顺序）
@@ -1997,22 +1999,28 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     p = pr;
                 else if ((pk = p.key) == k || (k != null && k.equals(pk)))
                     return p;
+                //左子树不通，右转
                 else if (pl == null)
                     p = pr;
+                //右子树不通，左转
                 else if (pr == null)
                     p = pl;
+                //左右子树都通，不知道怎么转，通过compare来确定走向
                 else if ((kc != null ||
                           (kc = comparableClassFor(k)) != null) &&
                          (dir = compareComparables(kc, k, pk)) != 0)
                     //用object的比较方法不好使，就用给定的kc比较方法来比较
                     //确保kc不为空且给定键k，当前键pk在规定的比较类kc下可比较，并设置比较结果为dir
                     p = (dir < 0) ? pl : pr;
-                //如果到这里，说明不知道该左转还是右转，（只使用一个递归可能是为了减少方法栈压力）
+                //如果到这里，说明左右转都无所谓，那么就右转（进入递归）
                 else if ((q = pr.find(h, k, kc)) != null)
                     return q;
+                //右转之后，遍历右子树没有找到对应的，就接着遍历左子树。
+                //********之所以上面要用一层递归，主要是如果直接右节点进入循环，那么左节点再也没机会进入循环了**********
                 else
                     p = pl;
             } while (p != null);
+            //如果遍历完树，没有找到满足hash和key的节点，那么返回null
             return null;
         }
 
@@ -2033,7 +2041,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
          * 也就是说这一步一定能确定要插入的节点要么是树的左节点，要么是右节点，不然就无法继续满足二叉树结构了
          *
          * 先比较两个对象的类名，类名是字符串对象，就按字符串的比较规则
-         * 如果两个对象是同一个类型，那么调用本地方法为两个对象生成hashCode值，再进行比较，hashCode相等的话返回-1
+         * 如果两个对象是同一个类型，那么调用本地方法为两个对象生成hashCode值（与重写的hashCode相区别），再进行比较，hashCode相等的话返回-1
          */
         static int tieBreakOrder(Object a, Object b) {
             int d;
@@ -2110,23 +2118,33 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
         /**
          * Tree version of putVal.
+         * 这个方法如果找到等价节点，只是直接返回。
+         * 如果没有找到，那么插入新节点并且返回空
          */
         final TreeNode<K,V> putTreeVal(HashMap<K,V> map, Node<K,V>[] tab,
                                        int h, K k, V v) {
             Class<?> kc = null;
             boolean searched = false;
             TreeNode<K,V> root = (parent != null) ? root() : this;
+            /*
+             * 通过hash比较从根节点向下遍历，直到hash值相等，再比通过键值在树种寻找
+             */
             for (TreeNode<K,V> p = root;;) {
                 int dir, ph; K pk;
+                //根据hash判断需要左转
                 if ((ph = p.hash) > h)
                     dir = -1;
+                //根据hash判断需要右转
                 else if (ph < h)
                     dir = 1;
+                //p已经满足hash和key
                 else if ((pk = p.key) == k || (k != null && k.equals(pk)))
                     return p;
+                //不知道左转还是右转，且compare也没能给出答案
                 else if ((kc == null &&
                           (kc = comparableClassFor(k)) == null) ||
                          (dir = compareComparables(kc, k, pk)) == 0) {
+                    //整个循环中只查一次，在树中找到满足hash及key的节点，如果不为空就返回
                     if (!searched) {
                         TreeNode<K,V> q, ch;
                         searched = true;
@@ -2136,11 +2154,16 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                              (q = ch.find(h, k, kc)) != null))
                             return q;
                     }
+                    //这里是是在给不出转向建议了，于是强行计算一个转向结果
                     dir = tieBreakOrder(k, pk);
                 }
 
                 TreeNode<K,V> xp = p;
+                /*
+                 * 通过上面的建议，左转或者右转并重新循环。如果已经没有节点可以遍历，那么新建一个节点加入树中并且返回空
+                 */
                 if ((p = (dir <= 0) ? p.left : p.right) == null) {
+                    //next是链结构，需要单独维护
                     Node<K,V> xpn = xp.next;
                     TreeNode<K,V> x = map.newTreeNode(h, k, v, xpn);
                     if (dir <= 0)
@@ -2318,6 +2341,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
          * Splits nodes in a tree bin into lower and upper tree bins,
          * or untreeifies if now too small. Called only from resize;
          * see above discussion about split bits and indices.
+         * 将一个槽中的树拆成两棵，一棵放在低hash槽，一个放在高hash槽。
+         * 如果树太小，可能会发生去树化。
+         * 该方法仅在resize的时候会被调用。
          *
          * @param map the map
          * @param tab the table for recording bin heads
@@ -2622,25 +2648,34 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         }
 
         /**
-         * Recursive invariant check
+         * Recursive invariant check。
+         * 递归检查t的链属性和树属性是否正常
          */
         static <K,V> boolean checkInvariants(TreeNode<K,V> t) {
             TreeNode<K,V> tp = t.parent, tl = t.left, tr = t.right,
                 tb = t.prev, tn = (TreeNode<K,V>)t.next;
+            //t的链序前节点是否后指向t
             if (tb != null && tb.next != t)
                 return false;
+            //t的链序后节点是否前指向t
             if (tn != null && tn.prev != t)
                 return false;
+            //在树结构中，t的父节点是否有子节点为t
             if (tp != null && t != tp.left && t != tp.right)
                 return false;
+            //在树结构中，t的左节点是否父节点为t，且hash顺序正确
             if (tl != null && (tl.parent != t || tl.hash > t.hash))
                 return false;
+            //在树结构中，t的右节点是否父节点为t，且hash顺序正确
             if (tr != null && (tr.parent != t || tr.hash < t.hash))
                 return false;
+            //是否出现了双红冲突
             if (t.red && tl != null && tl.red && tr != null && tr.red)
                 return false;
+            //向下检查左节点
             if (tl != null && !checkInvariants(tl))
                 return false;
+            //向下检查右节点
             if (tr != null && !checkInvariants(tr))
                 return false;
             return true;
