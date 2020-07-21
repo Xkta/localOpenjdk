@@ -885,12 +885,15 @@ public class HashMap<K,V> extends AbstractMap<K,V>
     final Node<K,V> removeNode(int hash, Object key, Object value,
                                boolean matchValue, boolean movable) {
         Node<K,V>[] tab; Node<K,V> p; int n, index;
+        //底层table不为空，传入的hash值对应的槽第一个节点不为空
         if ((tab = table) != null && (n = tab.length) > 0 &&
             (p = tab[index = (n - 1) & hash]) != null) {
             Node<K,V> node = null, e; K k; V v;
+            //如果槽首节点hash值与传入的hash值一样且键一样，那么得到要删除的节点的指针
             if (p.hash == hash &&
                 ((k = p.key) == key || (key != null && key.equals(k))))
                 node = p;
+            //否则，遍历槽，找到要删除节点的指针
             else if ((e = p.next) != null) {
                 if (p instanceof TreeNode)
                     node = ((TreeNode<K,V>)p).getTreeNode(hash, key);
@@ -906,6 +909,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     } while ((e = e.next) != null);
                 }
             }
+            //如果，要删除的节点指针不为空（需要比较值就添加值校验），下面是真正的删除操作。
             if (node != null && (!matchValue || (v = node.value) == value ||
                                  (value != null && value.equals(v)))) {
                 if (node instanceof TreeNode)
@@ -2162,25 +2166,48 @@ public class HashMap<K,V> extends AbstractMap<K,V>
          * linkages. If the current tree appears to have too few nodes,
          * the bin is converted back to a plain bin. (The test triggers
          * somewhere between 2 and 6 nodes, depending on tree structure).
+         *
+         * 在HashIterator的源码中会出现movable为false 的调用，这种调用不会对 table 的元素进行重排，所以适合一边迭代一边删除元素
+         *
+         * 该方法尝试删除调用对象所指向的节点。
          */
         final void removeTreeNode(HashMap<K,V> map, Node<K,V>[] tab,
                                   boolean movable) {
+            //需要注意：next是链结构维护的指针；prev是树结构维护的指针
             int n;
             if (tab == null || (n = tab.length) == 0)
                 return;
             int index = (n - 1) & hash;
+            /*
+             * first、root初始化为槽中第一个节点
+             * succ初始化为本节点后一个节点
+             * pred初始化为本节点前一个节点
+             */
             TreeNode<K,V> first = (TreeNode<K,V>)tab[index], root = first, rl;
             TreeNode<K,V> succ = (TreeNode<K,V>)next, pred = prev;
+            /*
+             * 先在链结构中删除本节点（需要注意：next是链结构维护的指针；prev是树结构维护的指针）
+             * 如果本节点为槽中第一个节点，则将槽中第一个节点设置为本节点后一个节点，且设置first为后一个节点的指针
+             * 如果本节点不是槽中第一个节点，那么设置本节点前一个节点向后指向本节点后一个节点
+             */
             if (pred == null)
                 tab[index] = first = succ;
             else
                 pred.next = succ;
+
+            //如果后节点不为空，那么后节点向前指向本节点前节点
             if (succ != null)
                 succ.prev = pred;
+
+            //如果槽中只有本节点一个节点（链结构删除后第一个节点为空），那么直接返回
             if (first == null)
                 return;
+
+            //如果链结构删除前第一个节点父节点不为空，则重新设置root指针（最终root指向槽中树的根节点）
             if (root.parent != null)
                 root = root.root();
+
+            //如果根节点
             if (root == null
                 || (movable
                     && (root.right == null
@@ -2190,17 +2217,30 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 return;
             }
             TreeNode<K,V> p = this, pl = left, pr = right, replacement;
+            /* 下降：
+             * 尝试将p下降到有一个空子树的位置：
+             *      1.下降之后两个子树都为空，那么p成为replacement
+             *      2.下降之后有且只有一个非空子树：那么非空子树成为replacement
+             * 下降之后，p可以直接删除。然后只需要从replacement的第一个节点对树重平衡即可，如果p为红色，则不需要再平衡。
+             *
+             * p和s换位置之后，各个指针非常混乱，不过只要总体思路清晰，指针管理注意一下就好了
+             * replacement的高度必然是0
+             */
             if (pl != null && pr != null) {
                 TreeNode<K,V> s = pr, sl;
+                //从该节点的右节点开始找到该节点的中序后继节点（非常简单）
                 while ((sl = s.left) != null) // find successor
                     s = sl;
+                //该节点颜色和该节点的中序后继节点互换
                 boolean c = s.red; s.red = p.red; p.red = c; // swap colors
                 TreeNode<K,V> sr = s.right;
                 TreeNode<K,V> pp = p.parent;
+                //如果该节点的中序后继节点就是该节点的右节点，那么现处理一下s和p这个组合的内部指针
                 if (s == pr) { // p was s's direct parent
                     p.parent = s;
                     s.right = p;
                 }
+                //处理一下s和p的折断指针（这里s原来的父节点会参与调整）
                 else {
                     TreeNode<K,V> sp = s.parent;
                     if ((p.parent = sp) != null) {
@@ -2212,7 +2252,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     if ((s.right = pr) != null)
                         pr.parent = s;
                 }
+                //由于s是p的中序后继，所以s和p换位后，p的左子树必为空
                 p.left = null;
+                //调整s和p的子树
                 if ((p.right = sr) != null)
                     sr.parent = p;
                 if ((s.left = pl) != null)
@@ -2223,6 +2265,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     pp.left = s;
                 else
                     pp.right = s;
+                //这里sr是p的右节点，p的左节点必为空
                 if (sr != null)
                     replacement = sr;
                 else
@@ -2234,8 +2277,11 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 replacement = pr;
             else
                 replacement = p;
+
+            //如果p有且只有一个非空子树，则删掉p，等待再平衡。否则直接对p再平衡
             if (replacement != p) {
                 TreeNode<K,V> pp = replacement.parent = p.parent;
+                //如果原来p是根节点，那么replacement成为新的根节点，并设置颜色为黑色；否则，将replacement拼接到原来p的父节点上
                 if (pp == null)
                     (root = replacement).red = false;
                 else if (p == pp.left)
@@ -2245,6 +2291,13 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 p.left = p.right = p.parent = null;
             }
 
+            /*
+             * 如果删掉的是一个红节点不需要再平衡，否则需要再平衡
+             * *********************
+             * 如果replacement是p，且为黑色，那么问题变得非常复杂。
+             * 如果replacement不是p，那么可知replacement的高度必然为零，问题非常简单。
+             * *********************
+             */
             TreeNode<K,V> r = p.red ? root : balanceDeletion(root, replacement);
 
             if (replacement == p) {  // detach
@@ -2362,7 +2415,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
         static <K,V> TreeNode<K,V> balanceInsertion(TreeNode<K,V> root,
                                                     TreeNode<K,V> x) {
             x.red = true;
-            /**
+            /*
              * 通过for循环完成双红冲突的向上传递，通过祖父的左右子树指针，完成对叔父节点左右位置的判断
              * 以上两点都是在插入流程中依赖的非常重要的两个条件。
              * 所有的操作都在向唯二的两个return靠拢。也就是一直在尝试退化成最简单的情况。
@@ -2436,7 +2489,33 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
         static <K,V> TreeNode<K,V> balanceDeletion(TreeNode<K,V> root,
                                                    TreeNode<K,V> x) {
+            /*
+             * 一、x==p,说明x就是p且p还没有删除，那么x删除之后x所在的子树黑高度会降低一，所以x欠了一个黑高度，需要找补回来
+             * 二、x!=p,说明p已经删除，x需要向上找补一个黑高度回来
+             *
+             * 如果x的兄弟节点改成红色，那么x的兄弟节点也需要找补一个黑高度回来，问题就变成了：
+             *      这两兄弟的父亲，xp需要找补一个黑高度回来
+             * 如果一直向上找补，一直到根节点，那么此时其实已经满足根节点子树都平衡了。
+             *
+             *
+             * 1. （循环出口）如果新平衡点x是空或者已经是根节点，那么直接返回根节点
+             * 2. （循环出口）如果x父节点为空，那么将x设置为黑色，并作为新的根节点返回。
+             * 3. （循环出口）如果x的颜色是红色，由于p是以黑色的身份被删除的，此时将x颜色改为黑色可以抵消p带来的黑色损失。最后返回原根节点。
+             * 4. 如果x为黑色(按理来讲，x两个子节点都为空)，且为左子树：
+             *      i）. x兄弟节点红色非空：
+             *          对父节点左旋，使新的兄弟节点变为黑色，新的父节点变为红色。变成归类b）该操作不影响黑高度，所以x不用上升。
+             *      a）. x兄弟节点为空：（这种情况非常少见，因为x和兄弟节点出现了高度差，这不正常，可能仅仅是习惯性空判断而已）
+             *          x向上：xp成为新的x。（x高度等待补偿1，变成了xp等待补偿1）
+             *      b）. x兄弟节点黑色非空
+             *          1）兄弟节点邻接子节点没有红色：那么兄弟节点设置为红色，
+             *             将兄弟节点从黑色改成红色，问题变成父节点等待补偿1（左右子节点都等待补偿1）
+             *          2）兄弟节点有红子节点：
+             *              对于>构型，先转化为\构型；对于\构型，直接父节点对右子树左旋，变更下对应的颜色，于是稳定
+             *
+             * 5. 如果x为黑色，且为右子树：镜像
+             */
             for (TreeNode<K,V> xp, xpl, xpr;;) {
+                //xp，xpl，xpr在使用之前都会重新初始化
                 if (x == null || x == root)
                     return root;
                 else if ((xp = x.parent) == null) {
@@ -2447,31 +2526,47 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     x.red = false;
                     return root;
                 }
+                //如果p还没删除，会经过这里，且第一次经过时这里的x就是待删除的p（且第一次进来的时候x黑高度必然为1）
+                //如果循环了很多次，那么这时x可能在树中间某个位置，黑高度大于1
                 else if ((xpl = xp.left) == x) {
+                    //兄弟节点是红色，那么旋转xp节点，情况变成了【A】：兄弟节点是黑色
                     if ((xpr = xp.right) != null && xpr.red) {
                         xpr.red = false;
                         xp.red = true;
                         root = rotateLeft(root, xp);
+                        //更新x的兄弟节点为左旋后的xp.right
                         xpr = (xp = x.parent) == null ? null : xp.right;
                     }
+                    //如果兄弟节点变成了空，那么兄弟节点失去了一个黑高度，问题就变成了父亲失去了一个黑高度，于是x=xp
                     if (xpr == null)
                         x = xp;
                     else {
+                        //【A】执行到这里，必然满足x为黑色，x的兄弟也是黑色
                         TreeNode<K,V> sl = xpr.left, sr = xpr.right;
+                        //x的兄弟节点的子节点：空空，黑黑（空黑和黑空违背黑高度，不可能出现）
                         if ((sr == null || !sr.red) &&
                             (sl == null || !sl.red)) {
+                            //这里只需要将兄弟节点从黑色改成红色，那么兄弟失去了一个黑高度，问题变成了父亲需要补偿一个黑高度
                             xpr.red = true;
                             x = xp;
                         }
                         else {
+                            //这个子过程中，一定会完成平衡，最后将root赋给x，并在下一次循环中确定结束
+                            //x的兄弟节点的子节点：红黑，黑红，红红，空红，红空都可能出现，兄弟的子树中至少有一个红色
                             if (sr == null || !sr.red) {
+                                //兄弟左子节点为红色
+                                //>构型，即兄弟的红节点方向与兄弟自己的方向不一样，先转化为\构型，对兄弟节点做右旋
+
+                                //兄弟改成红色之前，先将左子节点改黑，以免双红。染黑后成为新的兄弟节点
                                 if (sl != null)
                                     sl.red = false;
+                                //兄弟改成红色
                                 xpr.red = true;
                                 root = rotateRight(root, xpr);
                                 xpr = (xp = x.parent) == null ?
                                     null : xp.right;
                             }
+                            //此时兄弟右子节点必然是红色
                             if (xpr != null) {
                                 xpr.red = (xp == null) ? false : xp.red;
                                 if ((sr = xpr.right) != null)
