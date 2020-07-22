@@ -422,6 +422,9 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      * the HashMap or otherwise modify its internal structure (e.g.,
      * rehash).  This field is used to make iterators on Collection-views of
      * the HashMap fail-fast.  (See ConcurrentModificationException).
+     *
+     * 对该hashMap进行结构化修改的次数（结构化修改是指：更改hashMap中的映射次数，或者以其它方式修改内部结构）
+     * 此字段用于使hashMap的Collection-views上的迭代器k快速失败，（参见ConcurrentModificationException）
      */
     transient int modCount;
 
@@ -1010,6 +1013,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                     for (; e != null; e = e.next)
                         action.accept(e.key);
                 }
+                //如果forEach过程中，hashMap发生了结构化变化则抛出异常
                 if (modCount != mc)
                     throw new ConcurrentModificationException();
             }
@@ -1178,6 +1182,13 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      *
      * @throws ConcurrentModificationException if it is detected that the
      * mapping function modified this map
+     *
+     * 这个方法几乎和putIfAbsent是等价的，只不过所有更新v的操作被集中在一起且依赖mappingFunction的结果。
+     * 然而在putIfAbsent的底层实现中，所有v的更新操作都是分散的。
+     * 另外很奇怪的地方是，本方法在插入新值前如果size恰好等于阈值，不会触发resize。
+     *
+     * remappingFunction作用于键
+     *
      */
     @Override
     public V computeIfAbsent(K key,
@@ -1203,28 +1214,46 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                         old = e;
                         break;
                     }
+                    //在链表中找不到相等键时，用来记录槽中元素的总数，用来判断是否需要树化。
                     ++binCount;
                 } while ((e = e.next) != null);
             }
             V oldValue;
+            /*
+             * 不论是树节点还是链节点，只要1.key相等，2.值非空，那么就啥也不干，直接返回旧值
+             * 1-a. 等键值非空树节点
+             * 2-a. 等键值非空链节点
+             */
             if (old != null && (oldValue = old.value) != null) {
                 afterNodeAccess(old);
                 return oldValue;
             }
         }
+        //保证映射函数不会破坏map结构
         int mc = modCount;
         V v = mappingFunction.apply(key);
         if (mc != modCount) { throw new ConcurrentModificationException(); }
+
+        //需要更新v的操作
         if (v == null) {
             return null;
         } else if (old != null) {
+            /*
+             * 1-b 等键树节点值为空
+             * 2-b 等键链节点值为空
+             */
             old.value = v;
             afterNodeAccess(old);
             return v;
         }
         else if (t != null)
+            /*
+             * t表示first，用来证明槽中存的是树。由于old为空，可以得到树中无等键节点
+             * 1-c 树中无等键节点
+             */
             t.putTreeVal(this, tab, hash, key, v);
         else {
+            //2-c 链中无等键节点
             tab[i] = newNode(hash, key, v, first);
             if (binCount >= TREEIFY_THRESHOLD - 1)
                 treeifyBin(tab, hash);
@@ -1244,6 +1273,8 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      *
      * @throws ConcurrentModificationException if it is detected that the
      * remapping function modified this map
+     *
+     * remappingFunction作用于键和旧的value
      */
     @Override
     public V computeIfPresent(K key,
@@ -1252,6 +1283,10 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             throw new NullPointerException();
         Node<K,V> e; V oldValue;
         int hash = hash(key);
+        /*
+         * 因为在找不到等键节点的时候，computeIfPresent不需要知道所在的槽是树槽还是链槽，所以直接调用getNode方法就可以了
+         * 不需要像computeIfAbsent一样特定情况特定分析
+         */
         if ((e = getNode(hash, key)) != null &&
             (oldValue = e.value) != null) {
             int mc = modCount;
@@ -1277,6 +1312,11 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      *
      * @throws ConcurrentModificationException if it is detected that the
      * remapping function modified this map
+     *
+     * 如果v计算结果非空：覆盖旧的value
+     * 如果v计算结果为空：删除旧的节点
+     * remappingFunction作用于键和旧的value
+     *
      */
     @Override
     public V compute(K key,
@@ -1342,6 +1382,8 @@ public class HashMap<K,V> extends AbstractMap<K,V>
      *
      * @throws ConcurrentModificationException if it is detected that the
      * remapping function modified this map
+     *
+     * remappingFunction作用于旧的值和新的值，这也是merge的真正含义
      */
     @Override
     public V merge(K key, V value,
@@ -1573,6 +1615,10 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 throw new ConcurrentModificationException();
             if (e == null)
                 throw new NoSuchElementException();
+            /*
+             * 尝试直接访问节点的next节点，如果非空则得到新的下一个节点，如果得到为空，那么遍历table找到下一个非空槽
+             * 返回之前早就保存好的下一个节点
+             */
             if ((next = (current = e).next) == null && (t = table) != null) {
                 do {} while (index < t.length && (next = t[index++]) == null);
             }
@@ -1608,25 +1654,37 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
     /* ------------------------------------------------------------ */
     // spliterators
-
+    /*
+     * Spliterator接口是1.8新加的接口，字面意思可分割的迭代器，不同以往的iterator需要顺序迭代，
+     * Spliterator可以分割为若干个小的迭代器进行并行操作，既可以实现多线程操作提高效率，又可以避免普通迭代器的fail-fast机制所带来的异常
+     *
+     * map中有KeySpliterator, ValueSpliterator和EntrySpliterator都继承自内部抽象类HashMapSpliterator并实现了Spliterator接口,
+     * 因此可以通过这三个内部类获取相应的Spliterator来完成并发遍历HashMap
+     */
     static class HashMapSpliterator<K,V> {
-        final HashMap<K,V> map;
-        Node<K,V> current;          // current node
-        int index;                  // current index, modified on advance/split
-        int fence;                  // one past last index
-        int est;                    // size estimate
-        int expectedModCount;       // for comodification checks
+        final HashMap<K,V> map;     // 当前map
+        Node<K,V> current;          // current node 当前节点
+        int index;                  // current index, modified on advance/split 当前索引
+        int fence;                  // one past last index 一个可能过时的最后一个索引
+        int est;                    // size estimate 估计的大小
+        int expectedModCount;       // for comodification checks 期望调整次数（用于检查）
 
         HashMapSpliterator(HashMap<K,V> m, int origin,
                            int fence, int est,
                            int expectedModCount) {
             this.map = m;
             this.index = origin;
+            //这里初始化槽索引上限
             this.fence = fence;
             this.est = est;
             this.expectedModCount = expectedModCount;
         }
 
+        /*
+         * hi表示高位索引，lo表示低位索引
+         * fence维护了一个槽索引上限，本方法只会维护一次槽索引上限，并且在已经保存的槽索引上限（这个槽数实际上是对当前spliterator来说的）不小于0
+         * 的情况下，不会再维护一遍。
+         */
         final int getFence() { // initialize fence and size on first use
             int hi;
             if ((hi = fence) < 0) {
@@ -1634,6 +1692,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
                 est = m.size;
                 expectedModCount = m.modCount;
                 Node<K,V>[] tab = m.table;
+                //fence（槽索引上限）初始化为槽的个数
                 hi = fence = (tab == null) ? 0 : tab.length;
             }
             return hi;
@@ -1653,8 +1712,15 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             super(m, origin, fence, est, expectedModCount);
         }
 
+        //trySplit会调用getFence方法，初始化fence
         public KeySpliterator<K,V> trySplit() {
             int hi = getFence(), lo = index, mid = (lo + hi) >>> 1;
+            //将原集合拆成两半，原来的集合保存高索引的一半，新建一个并行迭代器保存低索引的一半
+            //如果lo和hi的中值没有大过lo，或者current已经被设值，那么不需要split，返回空
+            /*
+             * 1. 分裂一次之后，老的并行迭代器维护的槽索引上限保持不变，初始索引index被修改为mid。
+             * 2. 新的并行迭代器，初始化index为lo，初始化槽索引上限为mid，初始化为原映射数量的一半，继承变动数量
+             */
             return (lo >= mid || current != null) ? null :
                 new KeySpliterator<>(map, lo, index = mid, est >>>= 1,
                                         expectedModCount);
@@ -1668,19 +1734,24 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             Node<K,V>[] tab = m.table;
             if ((hi = fence) < 0) {
                 mc = expectedModCount = m.modCount;
+                //这里也修改了fence，重新初始化为槽的个数
                 hi = fence = (tab == null) ? 0 : tab.length;
             }
             else
                 mc = expectedModCount;
+            //if中有个有趣的条件，最后一个或运算：意味着要么给定的份额中还有槽没遍历，要么当前给定了一个槽
             if (tab != null && tab.length >= hi &&
                 (i = index) >= 0 && (i < (index = hi) || current != null)) {
                 Node<K,V> p = current;
                 current = null;
+                //遍历本split的份额；满足槽中都遍历，满足不超过给定的数组边界[index,hi]
                 do {
                     if (p == null)
+                        //再通过数组遍历，从一个槽移动到另一个槽
                         p = tab[i++];
                     else {
                         action.accept(p.key);
+                        //先把p所在的槽的后续节点都消费一遍（next只是槽内的指针）
                         p = p.next;
                     }
                 } while (p != null || i < hi);
@@ -1689,12 +1760,19 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             }
         }
 
+        //消费一个元素，推进当前元素指针
         public boolean tryAdvance(Consumer<? super K> action) {
             int hi;
             if (action == null)
                 throw new NullPointerException();
             Node<K,V>[] tab = map.table;
+            /*
+             * 1. 并行迭代器中对应的map中的表不能为空
+             * 2. 槽索引上限不能大于map的槽数
+             * 3. 槽索引下限不能小于0
+             */
             if (tab != null && tab.length >= (hi = getFence()) && index >= 0) {
+                //如果还有元素没被消费，找到第一个元素，消费它并返回。这之后当前元素指针推进一步。
                 while (current != null || index < hi) {
                     if (current == null)
                         current = tab[index++];
@@ -1711,6 +1789,7 @@ public class HashMap<K,V> extends AbstractMap<K,V>
             return false;
         }
 
+        //通过characteristics（）方法返回的值，用来标识实现类所具有的的特征（详见Spliterator接口源码）
         public int characteristics() {
             return (fence < 0 || est == map.size ? Spliterator.SIZED : 0) |
                 Spliterator.DISTINCT;
