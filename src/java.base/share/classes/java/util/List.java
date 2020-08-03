@@ -681,6 +681,9 @@ public interface List<E> extends Collection<E> {
     ListIterator<E> listIterator();
 
     /**
+     * 其实也是返回一个普通列表迭代器，只不过内部next指针初始化为index参数处的指针
+     * 这也是一种视图技巧
+     *
      * Returns a list iterator over the elements in this list (in proper
      * sequence), starting at the specified position in the list.
      * The specified index indicates the first element that would be
@@ -732,6 +735,16 @@ public interface List<E> extends Collection<E> {
      * @throws IndexOutOfBoundsException for an illegal endpoint index value
      *         ({@code fromIndex < 0 || toIndex > size ||
      *         fromIndex > toIndex})
+     *
+     *
+     * 此方法消除了对显式范围操作（数组通常存在的那种范围）的需要。
+     * 通过传递subList视图而不是整个列表，可以将期望列表的任何操作用作范围操作。例如，以下习惯用法从列表中删除了一系列元素：
+     * list.subList(from, to).clear();
+     *
+     *
+     * 可以为indexOf和lastIndexOf构造类似的习惯用法，并且Collections类中的所有算法都可以应用于subList。
+     * 如果基础列表（即隐式参数this指代的列表）以结构方式（而不是通过返回的列表）进行了修改，则此方法返回的列表的语义将变得不确定。
+     * （结构修改是指更改列表大小或以其他方式干扰列表的方式，以至于正在进行的迭代可能会产生错误的结果。）
      */
     List<E> subList(int fromIndex, int toIndex);
 

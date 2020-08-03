@@ -34,6 +34,9 @@ import java.util.function.Consumer;
  * Implementing this interface allows an object to be the target of the enhanced
  * {@code for} statement (sometimes called the "for-each loop" statement).
  *
+ * 集合类型通过实现Iterable（可迭代）接口可以提供增强型的for循环（for-each）
+ * 那由于Iterable本身就是集合框架中的顶层接口，所有集合框架下的集合类型都支持增强型的for循环
+ *
  * @param <T> the type of elements returned by the iterator
  *
  * @since 1.5
@@ -42,6 +45,7 @@ import java.util.function.Consumer;
 public interface Iterable<T> {
     /**
      * Returns an iterator over elements of type {@code T}.
+     * 返回一个迭代器
      *
      * @return an Iterator.
      */
@@ -57,6 +61,10 @@ public interface Iterable<T> {
      * The behavior of this method is unspecified if the action performs
      * side-effects that modify the underlying source of elements, unless an
      * overriding class has specified a concurrent modification policy.
+     *
+     * 集合框架中默认的foreach方法是不允许修改底层元素的，这种限制可以通过自行实现foreach
+     * 方法提供并行策略来打破，当然这可能并不是一个好的实践，通常有修改底层的需求建议是直接
+     * 使用for循环。
      *
      * @implSpec
      * <p>The default implementation behaves as if:
@@ -79,6 +87,7 @@ public interface Iterable<T> {
     /**
      * Creates a {@link Spliterator} over the elements described by this
      * {@code Iterable}.
+     * 通过一个可迭代接口描述的一堆元素来创建一个分流器。
      *
      * @implSpec
      * The default implementation creates an
@@ -92,6 +101,9 @@ public interface Iterable<T> {
      * capabilities, is unsized, and does not report any spliterator
      * characteristics. Implementing classes can nearly always provide a
      * better implementation.
+     *
+     * 该方法的默认实现总是应该被重写，因为它返回的默认分流器提供的分流性能比较差、大小不确定、且无法反映
+     * 具体的分流器特性。不过，该接口的实现类几乎都能对该方法提供一个更好的实现。
      *
      * @return a {@code Spliterator} over the elements described by this
      * {@code Iterable}.

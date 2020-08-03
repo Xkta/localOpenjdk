@@ -68,6 +68,14 @@ public class BitSet implements Cloneable, java.io.Serializable {
      * BitSets are packed into arrays of "words."  Currently a word is
      * a long, which consists of 64 bits, requiring 6 address bits.
      * The choice of word size is determined purely by performance concerns.
+     *
+     * 由于BitSet中的bit用word来组织及扩张，而word的长度又是2^6，最终索引都需要映射到每个字上面。
+     * 于是需要这个常量用来映射基于1的索引到基于64的索引
+     * 比如:
+     *  0 --> 0
+     *  1 --> 0
+     *  63 --> 0
+     *  64 --> 1
      */
     private static final int ADDRESS_BITS_PER_WORD = 6;
     private static final int BITS_PER_WORD = 1 << ADDRESS_BITS_PER_WORD;
